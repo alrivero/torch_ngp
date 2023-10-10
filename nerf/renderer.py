@@ -441,6 +441,72 @@ class NeRFRenderer(nn.Module):
 
         print(f'[mark untrained grid] {(count == 0).sum()} from {self.grid_size ** 3 * self.cascade}')
 
+    def full_update_extra_state(self, tmp_grid, decay=0.95, S=128):
+        X = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+        Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+        Z = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+
+        for xs in X:
+            for ys in Y:
+                for zs in Z:
+                    
+                    # construct points
+                    xx, yy, zz = custom_meshgrid(xs, ys, zs)
+                    coords = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [N, 3], in [0, 128)
+                    indices = raymarching.morton3D(coords).long() # [N]
+                    xyzs = 2 * coords.float() / (self.grid_size - 1) - 1 # [N, 3] in [-1, 1]
+
+                    # cascading
+                    for cas in range(self.cascade):
+                        bound = min(2 ** cas, self.bound)
+                        half_grid_size = bound / self.grid_size
+                        # scale to current cascade's resolution
+                        cas_xyzs = xyzs * (bound - half_grid_size)
+                        # add noise in [-hgs, hgs]
+                        cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
+                        # query density
+                        sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
+                        sigmas *= self.density_scale
+                        # assign 
+                        tmp_grid[cas, indices] = sigmas
+        
+        return tmp_grid
+    
+    def partial_update_extra_state(self, tmp_grid, decay=0.95, S=128):
+        N = self.grid_size ** 3 // 4 # H * H * H / 4
+        for cas in range(self.cascade):
+            # random sample some positions
+            coords = torch.randint(0, self.grid_size, (N, 3), device=self.density_bitfield.device) # [N, 3], in [0, 128)
+            indices = raymarching.morton3D(coords).long() # [N]
+            # random sample occupied positions
+            occ_indices = torch.nonzero(self.density_grid[cas] > 0).squeeze(-1) # [Nz]
+            if len(occ_indices) == 0:
+                tmp_grid = - torch.ones_like(self.density_grid)
+                tmp_grid = self.full_update_extra_state(tmp_grid, decay, S)
+                break
+
+            rand_mask = torch.randint(0, occ_indices.shape[0], [N], dtype=torch.long, device=self.density_bitfield.device)
+            occ_indices = occ_indices[rand_mask] # [Nz] --> [N], allow for duplication
+            occ_coords = raymarching.morton3D_invert(occ_indices) # [N, 3]
+            # concat
+            indices = torch.cat([indices, occ_indices], dim=0)
+            coords = torch.cat([coords, occ_coords], dim=0)
+            # same below
+            xyzs = 2 * coords.float() / (self.grid_size - 1) - 1 # [N, 3] in [-1, 1]
+            bound = min(2 ** cas, self.bound)
+            half_grid_size = bound / self.grid_size
+            # scale to current cascade's resolution
+            cas_xyzs = xyzs * (bound - half_grid_size)
+            # add noise in [-hgs, hgs]
+            cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
+            # query density
+            sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
+            sigmas *= self.density_scale
+            # assign 
+            tmp_grid[cas, indices] = sigmas
+        
+        return tmp_grid
+
     @torch.no_grad()
     def update_extra_state(self, decay=0.95, S=128):
         # call before each epoch to update extra states.
@@ -449,69 +515,16 @@ class NeRFRenderer(nn.Module):
             return 
         
         ### update density grid
-
         tmp_grid = - torch.ones_like(self.density_grid)
         
         # full update.
         if self.iter_density < 16:
-        #if True:
-            X = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
-            Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
-            Z = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
-
-            for xs in X:
-                for ys in Y:
-                    for zs in Z:
-                        
-                        # construct points
-                        xx, yy, zz = custom_meshgrid(xs, ys, zs)
-                        coords = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [N, 3], in [0, 128)
-                        indices = raymarching.morton3D(coords).long() # [N]
-                        xyzs = 2 * coords.float() / (self.grid_size - 1) - 1 # [N, 3] in [-1, 1]
-
-                        # cascading
-                        for cas in range(self.cascade):
-                            bound = min(2 ** cas, self.bound)
-                            half_grid_size = bound / self.grid_size
-                            # scale to current cascade's resolution
-                            cas_xyzs = xyzs * (bound - half_grid_size)
-                            # add noise in [-hgs, hgs]
-                            cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
-                            # query density
-                            sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
-                            sigmas *= self.density_scale
-                            # assign 
-                            tmp_grid[cas, indices] = sigmas
-
+            #if True:
+            tmp_grid = self.full_update_extra_state(tmp_grid, decay, S)
         # partial update (half the computation)
         # TODO: why no need of maxpool ?
         else:
-            N = self.grid_size ** 3 // 4 # H * H * H / 4
-            for cas in range(self.cascade):
-                # random sample some positions
-                coords = torch.randint(0, self.grid_size, (N, 3), device=self.density_bitfield.device) # [N, 3], in [0, 128)
-                indices = raymarching.morton3D(coords).long() # [N]
-                # random sample occupied positions
-                occ_indices = torch.nonzero(self.density_grid[cas] > 0).squeeze(-1) # [Nz]
-                rand_mask = torch.randint(0, occ_indices.shape[0], [N], dtype=torch.long, device=self.density_bitfield.device)
-                occ_indices = occ_indices[rand_mask] # [Nz] --> [N], allow for duplication
-                occ_coords = raymarching.morton3D_invert(occ_indices) # [N, 3]
-                # concat
-                indices = torch.cat([indices, occ_indices], dim=0)
-                coords = torch.cat([coords, occ_coords], dim=0)
-                # same below
-                xyzs = 2 * coords.float() / (self.grid_size - 1) - 1 # [N, 3] in [-1, 1]
-                bound = min(2 ** cas, self.bound)
-                half_grid_size = bound / self.grid_size
-                # scale to current cascade's resolution
-                cas_xyzs = xyzs * (bound - half_grid_size)
-                # add noise in [-hgs, hgs]
-                cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
-                # query density
-                sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
-                sigmas *= self.density_scale
-                # assign 
-                tmp_grid[cas, indices] = sigmas
+            tmp_grid = self.partial_update_extra_state(tmp_grid, decay, S)
 
         ## max-pool on tmp_grid for less aggressive culling [No significant improvement...]
         # invalid_mask = tmp_grid < 0
