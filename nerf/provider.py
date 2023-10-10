@@ -184,10 +184,14 @@ class NeRFDataset:
         else:
             # for colmap, manually split a valid set (the first frame).
             if self.mode == 'colmap':
+                # For now, just split so we get 10% of dataset evenly-spaced
+                mod_step = int(len(frames) * 0.1)
+                split_idxs = np.arange(len(frames)) % mod_step == 0
+
                 if type == 'train':
-                    frames = frames[1:]
+                    frames = np.array(frames)[~split_idxs]
                 elif type == 'val':
-                    frames = frames[:1]
+                    frames = np.array(frames)[split_idxs]
                 # else 'all' or 'trainval' : use all frames
             
             self.poses = []
